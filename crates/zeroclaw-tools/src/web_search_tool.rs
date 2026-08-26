@@ -34,6 +34,8 @@ pub struct WebSearchTool {
     boot_tavily_api_key: Option<String>,
     /// Boot-time Jina AI key snapshot.
     boot_jina_api_key: Option<String>,
+    /// Canonical AnySearch key when supplied by a runtime environment override.
+    anysearch_api_key_override: Option<String>,
     /// SearXNG instance base URL (e.g. `"https://searx.example.com"`).
     searxng_instance_url: Option<String>,
     max_results: usize,
@@ -57,6 +59,7 @@ impl WebSearchTool {
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: None,
             boot_jina_api_key: jina_api_key,
+            anysearch_api_key_override: None,
             searxng_instance_url: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
@@ -82,12 +85,41 @@ impl WebSearchTool {
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: tavily_api_key,
             boot_jina_api_key: jina_api_key,
+            anysearch_api_key_override: None,
             searxng_instance_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
             secrets_encrypt,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_config_and_anysearch_override(
+        model_provider: String,
+        brave_api_key: Option<String>,
+        tavily_api_key: Option<String>,
+        jina_api_key: Option<String>,
+        anysearch_api_key_override: Option<String>,
+        searxng_instance_url: Option<String>,
+        max_results: usize,
+        timeout_secs: u64,
+        config_path: PathBuf,
+        secrets_encrypt: bool,
+    ) -> Self {
+        let mut tool = Self::new_with_config(
+            model_provider,
+            brave_api_key,
+            tavily_api_key,
+            jina_api_key,
+            searxng_instance_url,
+            max_results,
+            timeout_secs,
+            config_path,
+            secrets_encrypt,
+        );
+        tool.anysearch_api_key_override = anysearch_api_key_override.filter(|key| !key.is_empty());
+        tool
     }
 
     /// Resolve the Brave API key, preferring the boot-time value but falling
@@ -839,6 +871,10 @@ impl WebSearchTool {
     }
 
     fn resolve_anysearch_api_key(&self) -> anyhow::Result<Option<String>> {
+        if let Some(key) = &self.anysearch_api_key_override {
+            return Ok(Some(key.clone()));
+        }
+
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -979,10 +1015,10 @@ impl WebSearchTool {
                 .unwrap_or("No title");
             let url = result.get("url").and_then(|url| url.as_str()).unwrap_or("");
             let body = result
-                .get("snippet")
-                .and_then(|snippet| snippet.as_str())
-                .filter(|snippet| !snippet.is_empty())
-                .or_else(|| result.get("content").and_then(|content| content.as_str()))
+                .get("content")
+                .and_then(|content| content.as_str())
+                .filter(|content| !content.is_empty())
+                .or_else(|| result.get("snippet").and_then(|snippet| snippet.as_str()))
                 .unwrap_or("");
 
             let mut block = vec![format!("{}. {}", index + 1, title), format!("   {url}")];
@@ -2349,6 +2385,7 @@ mod tests {
             boot_brave_api_key: None,
             boot_tavily_api_key: None,
             boot_jina_api_key: None,
+            anysearch_api_key_override: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),
             max_results: 5,
             timeout_secs: 15,
@@ -2860,6 +2897,30 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_anysearch_api_key_uses_environment_override_without_disk_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = WebSearchTool::new_with_config_and_anysearch_override(
+            "anysearch".to_string(),
+            None,
+            None,
+            None,
+            Some("environment-only-key".to_string()),
+            None,
+            5,
+            15,
+            config_path,
+            true,
+        );
+
+        assert_eq!(
+            tool.resolve_anysearch_api_key().unwrap().as_deref(),
+            Some("environment-only-key")
+        );
+    }
+
+    #[test]
     fn test_parse_anysearch_results_and_errors() {
         let tool = WebSearchTool::new("anysearch".to_string(), None, None, 5, 15);
         let response = serde_json::json!({
@@ -2885,8 +2946,8 @@ mod tests {
         let rendered = tool.parse_anysearch_results(&response, "rust").unwrap();
         assert!(rendered.contains("via AnySearch"));
         assert!(rendered.contains("AnySearch Example"));
-        assert!(rendered.contains("short snippet"));
-        assert!(!rendered.contains("long content"));
+        assert!(rendered.contains("long content"));
+        assert!(!rendered.contains("short snippet"));
         assert!(rendered.contains("fallback content"));
 
         let empty = serde_json::json!({"code": 0, "data": {"results": []}});
