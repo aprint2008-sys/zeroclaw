@@ -3210,7 +3210,7 @@ mod tests {
         assert_eq!(
             result,
             "Search results for: rust (via AnySearch)\n\
-             1. First Title\n   https://example.com/one\n   First body\n\
+             1. First Title\n   https://example.com/one\n   Longer first body\n\
              2. Second Title\n   https://example.org/two\n   Fallback body"
         );
     }
