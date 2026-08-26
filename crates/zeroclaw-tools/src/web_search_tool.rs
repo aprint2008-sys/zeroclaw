@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
+// AnySearch skill protocol identifier. Keep this synchronized with the
+// upstream anysearch-ai/anysearch-skill CLIENT_HEADER value.
+const ANYSEARCH_CLIENT_HEADER: &str = "skill/3.0.1";
+
 /// Web search tool for searching the internet.
 /// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
@@ -957,7 +961,8 @@ impl WebSearchTool {
         let request = client
             .post(url)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
+            .header("Accept", "application/json")
+            .header("X-Anysearch-Client", ANYSEARCH_CLIENT_HEADER);
         let request = match api_key {
             Some(key) => request.bearer_auth(key),
             None => request,
@@ -3009,6 +3014,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/search"))
+            .and(header("x-anysearch-client", ANYSEARCH_CLIENT_HEADER))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "code": 0,
                 "message": "success",
@@ -3044,6 +3050,7 @@ mod tests {
         .unwrap();
         Mock::given(method("POST"))
             .and(path("/v1/search"))
+            .and(header("x-anysearch-client", ANYSEARCH_CLIENT_HEADER))
             .and(header("authorization", "Bearer anysearch-secret"))
             .respond_with(ResponseTemplate::new(429))
             .mount(&authenticated_server)
