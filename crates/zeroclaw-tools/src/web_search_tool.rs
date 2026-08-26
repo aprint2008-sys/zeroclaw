@@ -120,8 +120,8 @@ impl WebSearchTool {
             config_path,
             secrets_encrypt,
         );
-        tool.anysearch_api_key_override = anysearch_api_key_override
-            .map(|key| key.filter(|value| !value.is_empty()));
+        tool.anysearch_api_key_override =
+            anysearch_api_key_override.map(|key| key.filter(|value| !value.is_empty()));
         tool
     }
 
