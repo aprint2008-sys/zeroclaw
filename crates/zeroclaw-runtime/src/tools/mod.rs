@@ -1051,8 +1051,7 @@ pub fn all_tools_with_runtime(
                 root_config
                     .pre_override_snapshots
                     .contains_key("web_search.anysearch_api_key")
-                    .then(|| root_config.web_search.anysearch_api_key.clone())
-                    .flatten(),
+                    .then(|| root_config.web_search.anysearch_api_key.clone()),
                 root_config.web_search.searxng_instance_url.clone(),
                 root_config.web_search.max_results,
                 root_config.web_search.timeout_secs,

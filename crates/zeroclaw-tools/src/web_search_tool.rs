@@ -34,8 +34,10 @@ pub struct WebSearchTool {
     boot_tavily_api_key: Option<String>,
     /// Boot-time Jina AI key snapshot.
     boot_jina_api_key: Option<String>,
-    /// Canonical AnySearch key when supplied by a runtime environment override.
-    anysearch_api_key_override: Option<String>,
+    /// Canonical AnySearch value when supplied by a runtime environment
+    /// override. The outer `Option` records that an override was applied; an
+    /// inner `None` explicitly selects anonymous mode.
+    anysearch_api_key_override: Option<Option<String>>,
     /// SearXNG instance base URL (e.g. `"https://searx.example.com"`).
     searxng_instance_url: Option<String>,
     max_results: usize,
@@ -100,7 +102,7 @@ impl WebSearchTool {
         brave_api_key: Option<String>,
         tavily_api_key: Option<String>,
         jina_api_key: Option<String>,
-        anysearch_api_key_override: Option<String>,
+        anysearch_api_key_override: Option<Option<String>>,
         searxng_instance_url: Option<String>,
         max_results: usize,
         timeout_secs: u64,
@@ -118,7 +120,8 @@ impl WebSearchTool {
             config_path,
             secrets_encrypt,
         );
-        tool.anysearch_api_key_override = anysearch_api_key_override.filter(|key| !key.is_empty());
+        tool.anysearch_api_key_override = anysearch_api_key_override
+            .map(|key| key.filter(|value| !value.is_empty()));
         tool
     }
 
@@ -872,7 +875,7 @@ impl WebSearchTool {
 
     fn resolve_anysearch_api_key(&self) -> anyhow::Result<Option<String>> {
         if let Some(key) = &self.anysearch_api_key_override {
-            return Ok(Some(key.clone()));
+            return Ok(key.clone());
         }
 
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
@@ -2906,7 +2909,7 @@ mod tests {
             None,
             None,
             None,
-            Some("environment-only-key".to_string()),
+            Some(Some("environment-only-key".to_string())),
             None,
             5,
             15,
@@ -2918,6 +2921,31 @@ mod tests {
             tool.resolve_anysearch_api_key().unwrap().as_deref(),
             Some("environment-only-key")
         );
+    }
+
+    #[test]
+    fn test_resolve_anysearch_api_key_blank_environment_override_forces_anonymous_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nanysearch_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        let tool = WebSearchTool::new_with_config_and_anysearch_override(
+            "anysearch".to_string(),
+            None,
+            None,
+            None,
+            Some(None),
+            None,
+            5,
+            15,
+            config_path,
+            true,
+        );
+
+        assert_eq!(tool.resolve_anysearch_api_key().unwrap(), None);
     }
 
     #[test]
