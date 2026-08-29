@@ -1,6 +1,7 @@
 use super::web_search_provider_routing::{
     SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
 };
+use crate::helpers::response_body;
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use regex::Regex;
@@ -14,6 +15,39 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 // AnySearch skill protocol identifier. Keep this synchronized with the
 // upstream anysearch-ai/anysearch-skill CLIENT_HEADER value.
 const ANYSEARCH_CLIENT_HEADER: &str = "skill/3.0.1";
+const ANYSEARCH_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+const ANYSEARCH_CONFIG_PARSE_ERROR: &str = "anysearch_config_parse_failed";
+
+fn anysearch_config_parse_line(contents: &str, error: &toml::de::Error) -> Option<usize> {
+    let offset = error.span()?.start.min(contents.len());
+    Some(
+        contents[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1,
+    )
+}
+
+fn anysearch_config_parse_attrs(path: &Path, line: Option<usize>) -> serde_json::Value {
+    let mut attrs = serde_json::json!({
+        "path": path.display().to_string(),
+        "search_provider": "anysearch",
+        "error_code": ANYSEARCH_CONFIG_PARSE_ERROR,
+    });
+    if let Some(line) = line {
+        attrs["line"] = line.into();
+    }
+    attrs
+}
+
+fn anysearch_config_parse_error(path: &Path, line: Option<usize>) -> anyhow::Error {
+    let location = line.map_or_else(String::new, |line| format!(", line {line}"));
+    anyhow::Error::msg(format!(
+        "Failed to parse config file {} for AnySearch API key ({ANYSEARCH_CONFIG_PARSE_ERROR}{location})",
+        path.display()
+    ))
+}
 
 /// Web search tool for searching the internet.
 /// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
@@ -900,23 +934,18 @@ impl WebSearchTool {
             ))
         })?;
 
-        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": self.config_path.display().to_string(),
-                        "search_provider": "anysearch",
-                        "error": format!("{}", e),
-                    })),
-                "web_search: failed to parse config for AnySearch API key"
-            );
-            anyhow::Error::msg(format!(
-                "Failed to parse config file {} for AnySearch API key: {e}",
-                self.config_path.display()
-            ))
-        })?;
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(&contents).map_err(|error| {
+                let line = anysearch_config_parse_line(&contents, &error);
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(anysearch_config_parse_attrs(&self.config_path, line)),
+                    "web_search: failed to parse config for AnySearch API key"
+                );
+                anysearch_config_parse_error(&self.config_path, line)
+            })?;
 
         let Some(raw_key) = config
             .web_search
@@ -974,7 +1003,16 @@ impl WebSearchTool {
             return Err(http_search_failure("anysearch", status));
         }
 
-        let json: serde_json::Value = response.json().await?;
+        let response_body =
+            response_body::read_bounded(response, Some(ANYSEARCH_RESPONSE_LIMIT_BYTES)).await?;
+        if response_body.overflowed {
+            anyhow::bail!(
+                "AnySearch response exceeds the {} byte size limit",
+                ANYSEARCH_RESPONSE_LIMIT_BYTES
+            );
+        }
+        let json: serde_json::Value = serde_json::from_slice(&response_body.bytes)
+            .map_err(|_| anyhow::Error::msg("Invalid AnySearch API response"))?;
         self.parse_anysearch_results(&json, query)
     }
 
@@ -2953,6 +2991,56 @@ mod tests {
         assert_eq!(tool.resolve_anysearch_api_key().unwrap(), None);
     }
 
+    #[tokio::test]
+    async fn test_anysearch_malformed_config_error_never_discloses_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let secret = "secret-that-must-not-escape";
+        let contents = format!("[web_search]\nanysearch_api_key = {secret}\n");
+        std::fs::write(&config_path, &contents).unwrap();
+        let tool = anysearch_tool(config_path.clone(), false);
+
+        let parse_error = toml::from_str::<zeroclaw_config::schema::Config>(&contents)
+            .expect_err("unquoted credential must be rejected");
+        let line = anysearch_config_parse_line(&contents, &parse_error);
+        assert_eq!(line, Some(2));
+        assert_eq!(
+            anysearch_config_parse_attrs(&config_path, line),
+            serde_json::json!({
+                "path": config_path.display().to_string(),
+                "search_provider": "anysearch",
+                "error_code": ANYSEARCH_CONFIG_PARSE_ERROR,
+                "line": 2,
+            })
+        );
+
+        let error = tool.resolve_anysearch_api_key().unwrap_err();
+        for rendering in [
+            error.to_string(),
+            format!("{error:#}"),
+            format!("{error:?}"),
+        ] {
+            assert!(rendering.contains(ANYSEARCH_CONFIG_PARSE_ERROR));
+            assert!(!rendering.contains(secret));
+            assert!(!rendering.contains("anysearch_api_key"));
+        }
+
+        let end_to_end_error = tool
+            .search_anysearch_with_client(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/v1/search",
+                "query",
+            )
+            .await
+            .unwrap_err();
+        assert!(!format!("{end_to_end_error:?}").contains(secret));
+        assert!(
+            end_to_end_error
+                .to_string()
+                .contains(ANYSEARCH_CONFIG_PARSE_ERROR)
+        );
+    }
+
     #[test]
     fn test_parse_anysearch_results_and_errors() {
         let tool = WebSearchTool::new("anysearch".to_string(), None, None, 5, 15);
@@ -3117,6 +3205,56 @@ mod tests {
                 .downcast_ref::<reqwest::Error>()
                 .is_some_and(reqwest::Error::is_timeout)
         );
+    }
+
+    #[tokio::test]
+    async fn test_anysearch_rejects_chunked_response_at_byte_limit_without_waiting_for_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let oversized = vec![b'x'; ANYSEARCH_RESPONSE_LIMIT_BYTES + 1];
+            stream
+                .write_all(format!("{:x}\r\n", oversized.len()).as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&oversized).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = anysearch_tool(config_path, false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tool.search_anysearch_with_client(
+                &reqwest::Client::new(),
+                &format!("http://{addr}/v1/search"),
+                "bounded query",
+            ),
+        )
+        .await
+        .expect("bounded reader must reject overflow before the server closes")
+        .unwrap_err();
+        assert!(result.to_string().contains("1048576 byte size limit"));
     }
 
     // ── Format characterization ──────────────────────────────────────────
